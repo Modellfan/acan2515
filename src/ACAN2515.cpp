@@ -6,6 +6,12 @@
 
 #include <ACAN2515.h>
 
+//--- ESP32: priority of the interrupt handler task (override with -D ACAN2515_ESP32_TASK_PRIORITY=n).
+//    Each MCP2515 has only two receive buffers: the task must run within about two frame times.
+#ifndef ACAN2515_ESP32_TASK_PRIORITY
+  #define ACAN2515_ESP32_TASK_PRIORITY 16
+#endif
+
 //------------------------------------------------------------------------------
 //   MCP2515 COMMANDS
 //------------------------------------------------------------------------------
@@ -225,7 +231,7 @@ uint16_t ACAN2515::beginWithoutFilterCheck (const ACAN2515Settings & inSettings,
       #endif
     }
     #ifdef ARDUINO_ARCH_ESP32
-      xTaskCreate (myESP32Task, "ACAN2515Handler", 1024 * 2, this, 16, NULL) ;
+      xTaskCreate (myESP32Task, "ACAN2515Handler", 1024 * 2, this, ACAN2515_ESP32_TASK_PRIORITY, NULL) ;
     #endif
   }
 //----------------------------------- Return
