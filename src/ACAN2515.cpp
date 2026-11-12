@@ -12,6 +12,12 @@
   #define ACAN2515_ESP32_TASK_PRIORITY 16
 #endif
 
+//--- ESP32: core of the interrupt handler task (override with -D ACAN2515_ESP32_TASK_CORE=0 or 1).
+//    Default: no affinity (as before).
+#ifndef ACAN2515_ESP32_TASK_CORE
+  #define ACAN2515_ESP32_TASK_CORE tskNO_AFFINITY
+#endif
+
 //------------------------------------------------------------------------------
 //   MCP2515 COMMANDS
 //------------------------------------------------------------------------------
@@ -231,7 +237,8 @@ uint16_t ACAN2515::beginWithoutFilterCheck (const ACAN2515Settings & inSettings,
       #endif
     }
     #ifdef ARDUINO_ARCH_ESP32
-      xTaskCreate (myESP32Task, "ACAN2515Handler", 1024 * 2, this, ACAN2515_ESP32_TASK_PRIORITY, NULL) ;
+      xTaskCreatePinnedToCore (myESP32Task, "ACAN2515Handler", 1024 * 2, this, ACAN2515_ESP32_TASK_PRIORITY, NULL,
+                               ACAN2515_ESP32_TASK_CORE) ;
     #endif
   }
 //----------------------------------- Return
@@ -695,46 +702,31 @@ void ACAN2515::handleRXBInterrupt (void) {
     if (message.idx > 5) {
       message.idx -= 6 ;
     }
-  //---
+  //--- One SPI block: READ RX BUFFER command, SIDH, SIDL, EID8, EID0, DLC, D0...D7.
+  //    Raising CS after READ RX BUFFER clears CANINTF.RXnIF (DS20001801J, 12.4), so no bit modify is needed.
+    uint8_t buffer [14] = {} ;
+    buffer [0] = accessRXB0 ? READ_FROM_RXB0SIDH_COMMAND : READ_FROM_RXB1SIDH_COMMAND ;
     select () ;
-    mSPI.transfer (accessRXB0 ? READ_FROM_RXB0SIDH_COMMAND : READ_FROM_RXB1SIDH_COMMAND) ;
-  //--- SIDH
-    message.id = mSPI.transfer (0) ;
-    message.id <<= 3 ;
-  //--- SIDL
-    const uint32_t sidl = mSPI.transfer (0) ;
-    message.id |= sidl >> 5 ;
+      mSPI.transfer (buffer, sizeof (buffer)) ;
+    unselect () ;
+    const uint32_t sidl = buffer [2] ;
+    message.id = ((uint32_t) buffer [1] << 3) | (sidl >> 5) ;
     message.rtr = (sidl & 0x10) != 0 ; // Only significant for standard frame
     message.ext = (sidl & 0x08) != 0 ;
-  //--- EID8
-    const uint32_t eid8 = mSPI.transfer (0) ;
     if (message.ext) {
-      message.id <<= 2 ;
-      message.id |= (sidl & 0x03) ;
-      message.id <<= 8 ;
-      message.id |= eid8 ;
+      message.id = (message.id << 2) | (sidl & 0x03) ;
+      message.id = (message.id << 8) | buffer [3] ;
+      message.id = (message.id << 8) | buffer [4] ;
     }
-  //--- EID0
-    const uint32_t eid0 = mSPI.transfer (0) ;
-    if (message.ext) {
-      message.id <<= 8 ;
-      message.id |= eid0 ;
-    }
-  //--- DLC
-    const uint8_t dlc = mSPI.transfer (0) ;
+    const uint8_t dlc = buffer [5] ;
   //--- DLC 9...15 is valid on the bus and means 8 data bytes; data[] holds only 8
     message.len = ((dlc & 0x0F) > 8) ? 8 : (dlc & 0x0F) ;
     if (message.ext) { // Added in 2.1.1 (thanks to Achilles)
       message.rtr = (dlc & 0x40) != 0 ; // RTR bit in DLC is significant only for extended frame
     }
-  //--- Read data
     for (int i=0 ; i<message.len ; i++) {
-      message.data [i] = mSPI.transfer (0) ;
+      message.data [i] = buffer [6 + i] ;
     }
-  //---
-    unselect () ;
-  //--- Free receive buffer command
-    bitModify2515Register (CANINTF_REGISTER, accessRXB0 ? 0x01 : 0x02, 0) ;
   //--- Enter received message in receive buffer (if not full)
     mReceiveBuffer.append (message) ;
   }
@@ -769,43 +761,33 @@ void ACAN2515::internalSendMessage (const CANMessage & inFrame, const uint8_t in
 //      Load TXB1, start at TXB1SIDH: 0x42
 //      Load TXB2, start at TXB2SIDH: 0x44
   const uint8_t loadTxBufferCommand = LOAD_TX_BUFFER_COMMAND | (inTXB << 1) ;
-//--- Send message
-  select () ;
-  mSPI.transfer (loadTxBufferCommand) ;
+//--- Send message: LOAD TX BUFFER command, SIDH, SIDL, EID8, EID0, DLC, data in one SPI block
+  uint8_t buffer [14] ;
+  uint8_t n = 0 ;
+  buffer [n++] = loadTxBufferCommand ;
   if (inFrame.ext) { // Extended frame
-    uint32_t v = inFrame.id >> 21 ;
-    mSPI.transfer ((uint8_t) v) ; // ID28 ... ID21 --> SIDH
-    v  = (inFrame.id >> 13) & 0xE0 ; // ID20, ID19, ID18 in bits 7, 6, 5
-    v |= (inFrame.id >> 16) & 0x03 ; // ID17, ID16 in bits 1, 0
-    v |= 0x08 ; // Extended bit
-    mSPI.transfer ((uint8_t) v) ; // ID20, ID19, ID18, -, 1, -, ID17, ID16 --> SIDL
-    v  = (inFrame.id >> 8) & 0xFF ; // ID15, ..., ID8
-    mSPI.transfer ((uint8_t) v) ; // ID15, ID14, ID13, ID12, ID11, ID10, ID9, ID8 --> EID8
-    v  = inFrame.id & 0xFF ; // ID7, ..., ID0
-    mSPI.transfer ((uint8_t) v) ; // ID7, ID6, ID5, ID4, ID3, ID2, ID1, ID0 --> EID0
+    buffer [n++] = (uint8_t) (inFrame.id >> 21) ; // ID28 ... ID21 --> SIDH
+    buffer [n++] = (uint8_t) (((inFrame.id >> 13) & 0xE0) | ((inFrame.id >> 16) & 0x03) | 0x08) ; // --> SIDL
+    buffer [n++] = (uint8_t) (inFrame.id >> 8) ; // ID15 ... ID8 --> EID8
+    buffer [n++] = (uint8_t) inFrame.id ; // ID7 ... ID0 --> EID0
   }else{ // Standard frame
-    uint32_t v = inFrame.id >> 3 ;
-    mSPI.transfer ((uint8_t) v) ; // ID10 ... ID3 --> SIDH
-    v  = (inFrame.id << 5) & 0xE0 ; // ID2, ID1, ID0 in bits 7, 6, 5
-    mSPI.transfer ((uint8_t) v) ; // ID2, ID1, ID0, -, 0, -, 0, 0 --> SIDL
-    mSPI.transfer (0x00) ; // any value --> EID8
-    mSPI.transfer (0x00) ; // any value --> EID0
+    buffer [n++] = (uint8_t) (inFrame.id >> 3) ; // ID10 ... ID3 --> SIDH
+    buffer [n++] = (uint8_t) ((inFrame.id << 5) & 0xE0) ; // ID2, ID1, ID0 --> SIDL
+    buffer [n++] = 0x00 ; // EID8
+    buffer [n++] = 0x00 ; // EID0
   }
-//--- DLC
-  uint8_t v = inFrame.len ;
-  if (v > 8) {
-    v = 8 ;
+  uint8_t len = inFrame.len ;
+  if (len > 8) {
+    len = 8 ;
   }
-  if (inFrame.rtr) {
-    v |= 0x40 ;
-  }
-  mSPI.transfer (v) ;
-//--- Send data
+  buffer [n++] = inFrame.rtr ? (uint8_t) (len | 0x40) : len ;
   if (!inFrame.rtr) {
-    for (uint8_t i=0 ; i<inFrame.len ; i++) {
-      mSPI.transfer (inFrame.data [i]) ;
+    for (uint8_t i=0 ; i<len ; i++) {
+      buffer [n++] = inFrame.data [i] ;
     }
   }
+  select () ;
+    mSPI.transfer (buffer, n) ;
   unselect () ;
 //--- Write send command
   select () ;
@@ -828,12 +810,11 @@ void ACAN2515::write2515Register (const uint8_t inRegister, const uint8_t inValu
 //------------------------------------------------------------------------------
 
 uint8_t ACAN2515::read2515Register (const uint8_t inRegister) {
+  uint8_t buffer [3] = {READ_COMMAND, inRegister, 0} ;
   select () ;
-    mSPI.transfer (READ_COMMAND) ;
-    mSPI.transfer (inRegister) ;
-    const uint8_t readValue = mSPI.transfer (0) ;
+    mSPI.transfer (buffer, sizeof (buffer)) ;
   unselect () ;
-  return readValue ;
+  return buffer [2] ;
 }
 
 //------------------------------------------------------------------------------
@@ -849,11 +830,11 @@ uint8_t ACAN2515::read2515Status (void) {
 //------------------------------------------------------------------------------
 
 uint8_t ACAN2515::read2515RxStatus (void) {
+  uint8_t buffer [2] = {RX_STATUS_COMMAND, 0} ;
   select () ;
-    mSPI.transfer (RX_STATUS_COMMAND) ;
-    const uint8_t readValue = mSPI.transfer (0) ;
+    mSPI.transfer (buffer, sizeof (buffer)) ;
   unselect () ;
-  return readValue ;
+  return buffer [1] ;
 }
 
 //------------------------------------------------------------------------------
@@ -861,11 +842,9 @@ uint8_t ACAN2515::read2515RxStatus (void) {
 void ACAN2515::bitModify2515Register (const uint8_t inRegister,
                                       const uint8_t inMask,
                                       const uint8_t inData) {
+  uint8_t buffer [4] = {BIT_MODIFY_COMMAND, inRegister, inMask, inData} ;
   select () ;
-    mSPI.transfer (BIT_MODIFY_COMMAND) ;
-    mSPI.transfer (inRegister) ;
-    mSPI.transfer (inMask) ;
-    mSPI.transfer (inData) ;
+    mSPI.transfer (buffer, sizeof (buffer)) ;
   unselect () ;
 }
 
